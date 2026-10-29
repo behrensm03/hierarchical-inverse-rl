@@ -1,281 +1,92 @@
-# PROPER SHOPPER
+# Hierarchical Inverse Reinforcement Learning for Norm-Adhering Shopping
 
-Original developers: [Teah Markstone](https://github.com/teahmarkstone/) and [Daniel Kasenberg](https://github.com/dkasenberg/)
+A course project (AI ethics, Tufts University, Fall 2025) that investigates whether an agent can learn ethical, norm-adhering shopping behavior from expert demonstrations alone, without a hand-written reward function, in a long-horizon task.
 
-Additional developers: [Matthias Scheutz](https://github.com/mscheutz/) and [Vasanth Sarathy](https://github.com/vasanthsarathy)
+**Team:** [Michael Behrens, Kelsey Zeng, Sanjana Sunder, Rahul Jamdade]
 
-## Task setting
+## Built on Proper Shopper
 
-An autonomous agent has to perform a shopping task in a simulated supermarket environment, gathering food items on a shopping list in a cart or basket, paying for them at the cash register and leaving the store with the purchased items. The simulation is based on [Gymnasium].(https://gymnasium.farama.org/) and can be run manually with keyboard input, or with autonomous agents (in Python and Java) connected via a socket connection.
+This project is an extension of the **Proper Shopper** environment, which is course-provided code written by Teah Markstone, Daniel Kasenberg, Matthias Scheutz, and Vasanth Sarathy. The original environment provides the supermarket simulation, the shopping task, the norms, and the game mechanics. See [`ENVIRONMENT_README.md`](ENVIRONMENT_README.md) for the original documentation and credits.
 
-## Dependencies:
+On top of that environment, we added:
 
-- python 3.12+
-- pip (to install any required libraries, e.g., "pip install pygame" or "pip install gymnasium")
-- pygame 2.5.0+
-- gymnasium 0.29.1
+- A **Q-learning expert** (carried over from individual assignments) that generates demonstrations.
+- A **hierarchical IRL (HIRL) pipeline** that learns a reward function and policy from those demonstrations.
+- An **experiment harness** for evaluating the pipeline against baselines.
 
-## Installing
+## Motivation
 
-### 1. Clone the repo
+Hand-designing reward functions is laborious, tends to be brittle, and bakes in the designer's own interpretation of what proper behavior is. Inverse reinforcement learning (IRL) instead infers a reward function from observed expert behavior. But standard IRL struggles on long-horizon tasks, especially when reward arrives only at the end.
 
-```
-git clone https://github.com/mscheutz/propershopper.git
-```
+We asked two questions:
 
-### 2. `cd` into the repo and create a new virtual environment
+1. Can an IRL agent learn ethical shopping behavior from expert demonstrations in this environment?
+2. Can it handle random shopping lists autonomously while adhering to norms?
 
-#### Prerequisites:
+> **Important scope note:** the pipeline is trained per shopping list and requires expert demonstrations of that specific list. It can only perform lists it has seen demonstrated, and it does not generalize to new lists. Our focus was reproducing observed behavior while adhering to norms, not generalization. See [Limitations](#limitations-and-future-work).
 
-- Your computer needs to have python3.12 installed. The above option "--python=..." must point to that installation.
-- You will need the "virtual environments" package installed: `pip install virtualenv --upgrade`
+## Task
+
+Given a list of 3 items, the agent must pick up a basket, walk to each of the 3 shelves and take the item, then go to the register and pay, all without violating store norms.
+
+## Approach
+
+1. **Generate demonstrations.** The Q-learning expert runs each shopping list 5 times with epsilon = 0.2 action noise, plus extra noise on the recorded x/y coordinates, so demonstrations take varied paths (without it, demos can be identical at certain subgoals).
+2. **Segment into subgoals.** Each demonstration is analyzed with a Bayesian mixture model over sliding windows of states. Where locally linear behavior breaks down, we mark a subgoal (these tend to be corners where the expert changes direction). A dynamic-programming step then assigns noisy demonstration states to subgoals and splits the demos accordingly.
+3. **Learn each subtask.** A separate maximum-entropy IRL agent is trained on each subgoal.
+4. **Chain.** To perform the full task, each subgoal agent generates its portion of the trajectory, and the pieces are stitched together.
+
+We also trained a **single-agent max-ent IRL baseline** on the full task with an enriched feature set (distances to the basket, items, and register, plus flags for holding the basket, each item, and having paid). It heads straight for the final location, never learns the required ordering, and fails. Even though it has extra features compared to our HIRL agent which hint at subgoals, they do not prescribe a required subgoal ordering, which the agent fails to grasp.
+
+## Experiment
+
+- 50 random shopping lists of 3 items each.
+- The expert is run per list with epsilon = 0.2 (the demonstrations the learner sees) and once more with epsilon = 0 as a best-case reference.
+- The baseline IRL agent generates one trajectory per list.
+- The HIRL pipeline is trained separately on each list, then samples 10 trajectories with epsilon = 0.05 and one greedy trajectory (epsilon = 0).
+- All trajectories are executed in the supermarket environment and scored on task success (every item taken and paid for) and violation-free rate (no norm violations).
+
+## Results
+
+| Agent | Task success | Violation-free |
+|---|---|---|
+| Expert (deterministic, upper bound) | 100% | 100% |
+| Expert demonstrations (noisy; what the learner sees) | 100% | 71% |
+| Single-agent max-ent IRL (baseline) | 0% | 0% |
+| HIRL pipeline, epsilon = 0.05 | 59% | 22% |
+| **HIRL pipeline, greedy** | **96%** | **92%** |
+
+- Hierarchy is what makes this work: the single-agent baseline fails completely (about 21 violations per run on average, up to 37), while the greedy HIRL agent succeeds on nearly every list.
+- The greedy HIRL agent is cleaner (92% violation-free) than the noisy demonstrations it learned from (71%).
+- It is also efficient: greedy HIRL stays within about 20 steps on average of the best-case expert.
+- Adding even 5% random actions causes a sharp drop. Failures fall into two buckets, not collecting all items or not paying, and both trace to one cause: for speed, the IRL stage *predicts* the next state with a simple function (step size added to current coordinates) instead of executing the action in the environment and observing the resulting state, and that prediction function ignores obstacles, for simplicity. An action that bumps into a shelf leaves the agent believing it is somewhere it is not, because the prediction function returns the updated coordinates as if the move succeeded, but in the environment, the agent actually bounces off the obstacle and remains in the same position, causing a discrepancy that persists for the remainder of the run. Even in failed runs the agent usually completes intermediate goals (on average 1.8 of 3 items in the basket in runs that failed to pay).
+
+## Simplifications to the environment
+
+- Agent step size set to 0.25, so positions are discretized to the nearest 0.25.
+- Turning mechanics removed from the learned agent's model; a wrapper turns the agent as needed before it moves or interacts. (In the original environment, an agent that faces east and executes a north move does not move but only turns to face north, and a subsequent north move would actually move the agent. we removed this.)
+- Only shelf items are used (no counters).
+
+## Limitations and future work
+
+- **No generalization across lists.** The pipeline is retrained from scratch for every shopping list, and it needs expert demonstrations of that exact list. Without demos, it has no way to produce the subgoals for a new list, so in practice it can only perform tasks an expert has already demonstrated. This is the biggest limitation of the project. A possible way to relax it is described under future work below.
+- **Handling lists not seen in training.** Subgoals come from a small vocabulary ("navigate to a location," "pick up an item", etc.), and the shopping task always follows the same pattern: basket, get items, register. A higher-level planner could build the subgoal sequence for a new list, select a previously learned reward parameter for each subgoal type (for example, a navigation policy defined on the displacement between the agent and its target), and chain them, with no demonstrations of that specific list and no retraining. We did not implement or test this, and how well learned policies transfer to unseen targets and still avoid norm violations is an open question.
+- The approximate transition model ignores obstacle collisions. A model that accounts for obstacles, possibly using the real environment, should close much of the gap under noise. We did experiment with having the agent actually perform the action in the environment and observe the resulting state, but this makes training significantly slower - executing the action, even with the headless simulation, is slower than a simple `x -> x + 0.25` operation, and would have made training times several orders of magnitude slower. Thus, we elected to use the approximate transition model as it was not the focus of the project. An intermediate approach could take into accound the coordinate locations of all obstacles and only updating coordinates when not bumping into an obstacle.
+
+## Running it
+
+Install the extra requirements (`pip install -r requirements.txt`), then:
 
 ```bash
-cd propershopper
-virtualenv --python=/usr/bin/python3.12 venv
+# Train the HIRL pipeline on a sample list and plot a sampled trajectory
+# (omit --learn_mode to use our pre-trained parameters)
+python irl_agents_separate.py --learn_mode
+
+# Execute the generated trajectory in the supermarket environment (two terminals)
+python socket_env.py --player_speed=0.25 --file=start-state.txt
+python run-generated-irl-trajectory.py
 ```
 
-This will create a folder called "venv" inside the project directory, which is where all your pip packages will be installed.
+## Acknowledgments
 
-Basically, the idea is that you want the packages (and their specific versions) to be associated with JUST this project. This is because for different projects you might need different versions of pip packages, and you don't want your computer to be all confused about these different versions. So, instead, we just create a "Virtual environment" and install all our pip packages in there. This is self contained and does not pollute the global python in your computer.
-
-IMPORTANT: Always remember to activate the virtual environment before running `pip install` on any new package so that you ensure it installs in the correct location.
-
-### 4. Activate the virtual environment:
-
-```bash
-source venv/bin/activate
-```
-
-IMPORTANT: Always remember to activate the virtual environment before running `pip install` on any new package so that you ensure it installs in the correct location.
-
-### 3. Install the project requirements:
-
-```bash
-pip install -r requirements.txt
-```
-
-## Running keyboard input
-
-Running the simulation with keyboard input is a good way to get a sense of the physics of the simulation and how interaction with objects works.
-
-To run keyboard input, while in the "proppershopper" directory, run
-
-```
-<python-command> socket_env.py --keyboard_input
-```
-
-where <python-command> is your command for running python.
-
-## Running with an autonomous agent through a socket
-
-From a terminal in the proper shopper directory, use your python command to run socket_env.py (without any arguments):
-
-```
-<python-command> socket_env.py
-```
-
-For debugging you can start "socket_env.py" with a --file <path_to_file> flag that will load in the state from the file at the specified path. You can use your keyboard input (with "<yourpythoncommand> socket_env.py --keyboard_input") to press the 's' key while running the simulation. If you then enter a filename in the terminal from which they're running the simulation (e.g., "myseed.txt"), then the current state of the game will be saved to "myseed.txt" and can later be reloaded using --file flag.
-
-### Running the simulation with Python agents
-
-Take a look at the "socket_agent.py" file which has an example of how to interact with the simulation through a socket. The format for sending actions is "<agentnumber> <actioncommand>" (the commands are described below). Here is the snippet:
-
-```
-# build an action packet assuming this is the only agent in the game
-action = "0 " + random.choice(action_commands)
-
-# send it to the environment
-sock_game.send(str.encode(action))
-
-# get an observation back
-output = recv_socket_data(sock_game)  # get observation from env
-output = json.loads(output)
-```
-
-You can then run it (assuming the simulation is already running in another terminal) using
-
-```
-python socket_agent.py
-```
-
-### Running the simulation with Java agents
-
-Put all of your agent code into a class called Agent.java (a template is in the repo) which has the following structure:
-
-```
-import com.supermarket.*;
-
-public class Agent extends SupermarketComponentImpl {
-	public Agent() {
-		super();
-		shouldRunExecutionLoop = true;
-	}
-
-	@Override
-	protected void executionLoop() {
-		// this is called every 100ms
-		// put your code in here, e.g.
-	      goSouth();
-	}
-}
-```
-
-Assuming you put the class in the same directory as you Agent.jar, then you can compile it in that directory using:
-
-```
-	javac -cp Agent.jar Agent.java
-```
-
-and you can run using the following (after you first made sure that the socket is running, won’t work without it!)
-
-```
-	java -cp .:Agent.jar Agent Agent <any other args>
-```
-
-(Use “;” instead of “:” for Windows!)
-
-## Command Line Options
-
-When running through the socket or from keyboard input, there are a number of command line arguments to specify aspects of the supermarket.
-
-- `--num_players=<number of players>` specifies the number of players in the environment
-- `--port=<port number>` specifies which port to bind to
-- `--headless` sets the environement to headless mode
-- `--keyboard_input` sets the environment to use keyboard input
-- `--file=<filename>` loads the state from the specified file
-- `--follow=<player ID>` specifies which player to follow
-- `--random_start` sets players to start in random locations
-- `--render_number` sets environment to render player ID above players
-- `--render_messages` sets environment to render messages when interacting with objects
-- `--bagging` sets checkout option to use bagging
-- `--player_sprites=<filename>` sets player sprites to specified sprites
-- `--record_path=<path>` sets path for files when record action is used
-
-## Norm Monitoring
-
-When run through keyboard input or through the socket, a norm monitor gym wrapper is automatically used and monitors all implemented norms. Currently we have 26 norm monitors implemented:
-
-- `BasketTheftNorm()` Logs norm violation if player steals another player's basket
-- `WrongShelfNorm()` Logs norm violation if player puts an item back on the wrong shelf
-- `ShopliftingNorm()` Logs norm violation if player leaves the store with unbought items in their inventory
-- `PlayerCollisionNorm()` Logs norm violation if player collides with another player
-- `ObjectCollisionNorm()` Logs norm violation if player collides with an object
-- `WallCollisionNorm()` Logs norm violation if player collides with a wall
-- `BlockingExitNorm()` Logs norm violation if player is standing in front of an exit
-- `EntranceOnlyNorm()` Logs norm violation if player exits store through the entrance
-- `UnattendedCartNorm()` Logs norm violation if player leaves a cart at a distance of 5 or more for 5 or more timesteps
-- `UnattendedBasketNorm()` Logs norm violation if player leaves a cart at a distance of 5 or more for 5 or more timesteps
-- `OneCartOnlyNorm()` Logs norm violation if player takes more than one cart from the cart return
-- `OneBasketOnlyNorm()` Logs norm violation if player takes more than one basket from the basket return
-- `PersonalSpaceNorm(dist_threshold=<distance>)` Logs norm violation if player gets too close to another player with specified distance threshold
-- `InteractionCancellationNorm()` Logs norm violation if player cancels interaction
-- `LeftWithBasketNorm()` Logs norm violation if bagging option is being used and the player leaves the store with a basket
-- `ReturnBasketNorm()` Logs norm violation if player does not return all of their baskets before leaving the store
-- `ReturnCartNorm()` Logs norm violation if player does not return all of their carts before leaving the store
-- `WaitForCheckoutNorm()` Logs norm violation if player cuts in line at checkout
-- `ItemTheftFromCartNorm()` Logs norm violation if player takes item out of another player's cart
-- `ItemTheftFromBasketNorm()` Logs norm violation if player takes item out of another player's basket
-- `AdhereToListNorm()` Logs norm violation if player picks up an item that is not on their shopping list
-- `TookTooManyNorm()` Logs norm violation if player takes more of one kind of food item than is on their list
-- `BasketItemQuantNorm(basket_max=<max items>)` Logs norm violation if player takes a basket when the amount of items on their shopping list exceeds the set max capacity for the basket
-- `CartItemQuantNorm(cart_min=<min items>)` Logs norm violation if player takes a cart when the amount of items on their shopping list is below the minimum number of items that require a cart
-- `UnattendedCheckoutNorm()` Logs norm violation if player leaves a cart in the checkout zone for too long (non-bagging) or walks away from checkout counter while their items are on the counter (bagging)
-
-To use the norm wrapper gym environment, pass in a supermarket environment and a list of the above norms to be monitored. The violations are returned as an observation from the norm environment. In keyboard input, the norms are printed out to the terminal.
-
-## Playing the game
-
-### Actions and environment dynamics
-
-Below is a table of the gym ids of the actions available in this environment (left column), the corresponding action (middle column), and the key to press in keyboard input mode to perform the action (right column):
-
-| gym id | Action             | Key          |
-| ------ | ------------------ | ------------ |
-| 0      | No-op              | N/A          |
-| 1      | North              | Up arryow    |
-| 2      | South              | Down arrow   |
-| 3      | East               | Right arrow  |
-| 4      | West               | Left arrow   |
-| 5      | Interact           | Enter/Return |
-| 6      | Toggle cart        | 'c'          |
-| 7      | Cancel interaction | 'b'          |
-| 8      | Pick Up            | N/A          |
-| N/A    | View inventory     | 'i'          |
-| N/A    | View shopping list | 'l'          |
-
-Actions are formatted as tuples. In the pick-up action an agent can specify an index that corresponds with a food item.
-
-While the best way to get a sense for how the game works is to try running it in keyboard input mode, here is a reasonably-detailed description of the actions available and what they do in different contexts:
-
-- North, south, east, west: move the player around on the screen.
-- No-op: does nothing. You probably won’t need to get the agent to perform this action.
-- **Interact** with object: only works when the agent is adjacent to and facing a particular object in the game. Pauses the player’s ability to navigate while a message is displayed on screen; you must perform the “interact with action” or “cancel interaction” effect again to clear this message and continue running the game. When holding a shopping cart, the player cannot interact with any objects aside from the cart itself. Otherwise, effect depends on the object in question:
-  - Carts and Baskets:
-    - The user may do this from in front of, behind, or beside a shopping cart/basket.
-    - If the player is holding food, this action will put it in the cart/basket.
-    - Otherwise, in keyboard input a menu of the items in the cart/basket will be displayed and the player can navigate it with up and down arrows. Use return key to take selected food item out of cart.
-  - Cart return (bottom left corner of supermarket): if the player is not holding a shopping cart, this will cause the player to pick up a new cart. If they are holding a cart, it will be returned.
-  - Basket return (next to cart return): if the player is not holding a basket, this will cause the player to pick up a new basket. If they are holding a basket, it will be returned.
-  - Shelf:
-    - If the player is currently holding food, this command will “put it back on the shelf” (so that the player is no longer holding it).
-    - Otherwise, the player will pick up the shelf’s food item.
-  - Food counters (right side of supermarket):
-    - If the player is not currently holding food, this command will cause the agent to pick up the counter’s food (the top counter is “prepared foods”, the bottom counter is “fresh fish”).
-    - This is a two-stage interaction, meaning that two consecutive messages are displayed (and thus the “interact with object” action must be performed three times total to complete the transaction and continue the game).
-  - Checkout (left side of supermarket)
-    - Non-bagging Option:
-      - Interacting with the checkout causes the purchase of (1) any unpurchased items that are currently in the player’s hand, and (2) any unpurchased items that are in carts that are directly above or below the checkout aisle.
-      - Place your shopping cart either directly below or directly above the checkout if you want to purchase its contents.
-      - This is a two-stage interaction, meaning that two consecutive messages are displayed (and thus the “interact with object” action must be performed three times total to complete the transaction and continue the game).
-    - Bagging Option:
-      - Interacting with the checkout renders a message saying to place items on counter. If player is holding a food item and interacts with the checkout counter, the food item will be placed on the counter.
-      - If there are already food items on the counter and a player interacts, in keyboard input a menu will appear where a player can either select a food item to take off of the counter, exit the menu, or buy all of the items on the counter
-      - In non-keyboard input, the interact action buys all the items on the counter. The agent can use the pick up action to pick up a specified food from the counter.
-- **Pick up** item: used in gym environment to pick up food items from baskets, carts, and checkout counters. This action is only used through the environment, not with keyboard input. The second argument of the action specifies an index that corresponds to a food type in a list in the supermarket class. If the food item is in the interacted with object, the item will be removed and put into the player's hands.
-- Cancel interaction: clears any messages caused by interacting with an object. For two-stage interactions (checkout and food counters) this will cancel the transaction in question (not obtain the counter’s food; not purchase cart contents). For one-stage interactions, this is equivalent to clearing the messages using “interact with object”.
-- Toggle shopping cart: if the user is currently holding a shopping cart, this lets go of the cart. Otherwise, picks up the cart. Note that to pick up a cart, the user must be behind the shopping cart (adjacent to the handle).
-- Display inventory: displays a list of the food (a) that the player is holding, or (b) that is in the player’s cart, and the quantities of each food. Only available in keyboard mode; not necessary in gym/socket mode (since this information is already available in the observation).
-- Display shopping list: displays a list of the food on the player’s shopping list, and the quantities of each food. Only available in keyboard mode; not necessary in gym/socket mode (since this information is already available in the observation).
-
-### General facts
-
-- Objects are solid; you can’t walk through walls, shelves, shopping carts, or baskets
-- When holding a shopping cart, that cart is an extension of you for collision purposes; the cart won’t pass through solid objects either
-- Shopping lists are randomly generated when the game initializes, and have anywhere between 1 and 12 items
-- Shopping carts can each carry a maximum of 12 food items
-- Baskets can carry a maximum of 6 items
-- There are 12 baskets and 12 carts in the environment. When all carts or baskets are taken from the cart/basket return, the object will still be solid but have no image so that players can still interact return their carts or baskets.
-- Food items must (for now) be picked up and placed in the cart one at a time. If you need three apples, you must do the following three times: go to the shelf, pick up an apple, go to the cart, put the apple in the cart.
-- To put food items in a basket, the player just needs to interact with a shelf while holding a basket.
-- The player can leave their shopping cart or basket anywhere in the store, and can even have multiple shopping carts and baskets: any item in any of your carts/baskets counts towards your inventory
-- You can only hold one shopping cart or basket at a time
-- Putting food back on the wrong shelf does not mean you’ll pick up the wrong food when you interact with that shelf later (if you were in a grocery store in the canned foods aisle looking for soup and saw 15 cans of soup and one apple, would you pick up the apple?)
-- In keyboard mode, the green number next to food items on a player's inventory is the number of purchased items of that food, and the red number is unpurchased.
-- A red line will cross off an item on your shopping list when the correct amount of a certain food is in a player's inventory.
-- You can’t leave a cart above or below one checkout, and then expect your food to be purchased when you interact with the other checkout. This should more or less go without saying.
-- In the keyboard input mode, you can exit the game with the ESC key, or by leaving through the exit door. You can also Ctrl+C out of the Python program or “X out” of the window.
-- In gym or socket mode, you can exit the game by leaving through the exit door, Ctrl+C in your terminal, or “X out” of the window. However, in socket mode, I recommend closing whatever process is interacting with the socket first (if you exit the simulation first, the socket might remain open and make it so that you can’t rerun the simulation for a minute or so).
-
-### Observations
-
-When you use it as a gym env or in socket mode, you're going to need to access the state observations.
-
-- The observation keeps track of the states of the individual objects (players, carts, baskets, shelves, registers, cart returns, counters, checkouts). There’s an array for each class of object.
-  - All objects have a position (a 2D array x and y). Objects other than carts and players also have a width and height. Be careful in how you interpret this; just because a person is colliding with an object doesn’t mean that object.x < player.x < object.x + object.width, etc. Take a look at the collision() and canInteract() methods for various object classes to get a sense of how this actually works.
-  - Shelves and counters have a particular food associated with them, represented as a string (“apples”, etc.)
-  - Players, carts, and baskets are facing a particular direction (0=north, 1=south, 2=east, 3=west).
-  - Players may be holding a particular food (field “holding_food”, will be null if not holding any food).
-  - Players have a shopping list shopping_list of food strings (matching those on particular shelves). There’s a corresponding list list_quant of the number of each type of food on the list. For example, if player.shopping_list[i].equals(“apples”), then player.list_quant[i] is the number of apples on the shopping list.
-    The Player’s curr_cart is the index in observation.carts of the cart the player is holding, or -1 if the player is not holding a cart.
-  - Each cart has an owner (who first picked the cart up from the cart return) and a separate variable last_held (who last touched the cart). This probably won’t matter in single-agent settings, but would matter in multi-agent games.
-  - Each cart has a capacity. This’ll just be 12.
-  - Each cart has variables contents and contents_quant (same format as a player’s shopping list, but for the unpurchased contents of a cart) and purchased_contents and purchased_quant (same format, but for the purchased contents of a cart).
-    The above is true for baskets as well.
-- Each player keeps track of their own interaction stage with an object:
-  - If a player is not currently interacting with an object (i.e., if no interaction message is on the screen), interactive_stage=-1 and total_stages=0.
-  - Otherwise, a player is interacting with some object; interactive_stage is the (zero-indexed) current stage, and total_stages will be 1 or 2 depending on if the interaction in question is a zero-stage interaction.
-- The observation contains a little information about the “interactive stage” of the game, which can presumably help you remember to call interactWithObject() an appropriate number of times:
-  - If the user is not currently interacting with an object (i.e., if no interaction message is on the screen), interactive_stage=-1 and total_stages=0.
-  - Otherwise, the user is interacting with some object; interactive_stage is the (zero-indexed) current stage, and total_stages will be 1 or 2 depending on if the interaction in question is a zero-stage interaction.
-- The observation has some helper methods that may come in handy. You can rely on the individual objects’ collision() and canInteract() methods (they’re identical to those in the python simulation); be a bit more wary of the other ones. The helper methods are still very much under active development.
+Thank you to the course instructors for the Proper Shopper environment and for the project framework.
